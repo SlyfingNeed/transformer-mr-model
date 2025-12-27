@@ -54,7 +54,7 @@ for _, trade in sells.iterrows():
         y_val = portfolio_history.loc[trade['Date'], 'Portfolio_Return_Pct']
         color = '#00C853' if trade['Return'] > 0 else '#D50000'
         marker = '^' if trade['Reason'] == 'TAKE_PROFIT' else 'v' if trade['Reason'] == 'STOP_LOSS' else 'o'
-        ax1.scatter(trade['Date'], y_val, color=color, marker=marker, s=30, alpha=0.6, zorder=4)
+        ax1.scatter(trade['Date'], y_val, color=color, marker=marker, s=30, alpha=0.6, zorder=4) # pyright: ignore[reportArgumentType]
 
 ax1.set_title('Cumulative Returns Over Time with Trade Markers', fontsize=13, fontweight='bold', pad=10)
 ax1.set_ylabel('Cumulative Return (%)', fontsize=11)

@@ -17,13 +17,13 @@ torch.manual_seed(42)
 START_DATE = '2025-01-01'
 END_DATE = '2025-12-24'
 INITIAL_CAPITAL = 100000
-REBALANCE_FREQUENCY = 'W'  #weekly, change to M for monthly
+REBALANCE_FREQUENCY = 'M'  # monthly rebalancing for investment strategy
 MIN_STOCKS = 2
 MAX_STOCKS = 7
-TAKE_PROFIT_THRESHOLD = 0.15  # max of 15% take profit
-STOP_LOSS_THRESHOLD = -0.08   # 8% stop loss
+ATR_MULTIPLIER = 2.5  # dynamic take profit = ATR * multiplier
+STOP_LOSS_THRESHOLD = -0.10   # 10% stop loss (wider for investment strategy)
 MIN_PROBABILITY = 0.55         # minimum probability to enter position
-MIN_HOLDING_DAYS = 5           # minimum days to hold before selling
+MIN_HOLDING_DAYS = 21           # minimum 21 days (~3 weeks) to hold before selling
 
 print("\n" + "="*80)
 print(" Portfolio Equity Simulation ")
@@ -31,10 +31,11 @@ print("="*80)
 print(f"\nConfiguration:")
 print(f"  Period: {START_DATE} to {END_DATE}")
 print(f"  Initial Capital: ${INITIAL_CAPITAL:,.0f}")
-print(f"  Rebalancing: {REBALANCE_FREQUENCY}ly")
+print(f"  Rebalancing: {REBALANCE_FREQUENCY}onthly")
 print(f"  Portfolio Size: {MIN_STOCKS}-{MAX_STOCKS} stocks")
-print(f"  Take Profit: {TAKE_PROFIT_THRESHOLD*100:.1f}%")
+print(f"  Take Profit: Dynamic (ATR * {ATR_MULTIPLIER})")
 print(f"  Stop Loss: {STOP_LOSS_THRESHOLD*100:.1f}%")
+print(f"  Min Holding Days: {MIN_HOLDING_DAYS}")
 
 # Load data from screener csv
 csv_path = os.path.join(os.path.dirname(__file__), '..', 'stock-pick', 'sp500_stock_picks.csv')
@@ -115,6 +116,26 @@ def predict_with_model(model, recent_returns):
         mean, std = model(X)
         return mean.item(), std.item()
 
+# Helper function for RSI calculation
+def calculate_rsi(prices, period=14):
+    """Calculate RSI indicator"""
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Helper function for MACD
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Calculate MACD indicator"""
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
 # eval performance
 def evaluate_stock(ticker, data, current_date):
     """Evaluate a stock using transformer and t-student distt to pick for trade"""
@@ -151,12 +172,62 @@ def evaluate_stock(ticker, data, current_date):
     momentum = returns.tail(10).mean()
     sharpe = mean_pred / (std_pred + 1e-8) if std_pred > 0 else 0
     
-    # Composite scoring
+    # Calculate ATR (Average True Range) for dynamic take profit
+    high = historical['High'].tail(20)
+    low = historical['Low'].tail(20)
+    close = historical['Close'].tail(20)
+    
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.mean()
+    atr_pct = atr / close.iloc[-1]  # ATR as percentage of current price
+    
+    # RSI for mean reversion signal (oversold = buy opportunity)
+    rsi = calculate_rsi(historical['Close'], period=14)
+    current_rsi = rsi.iloc[-1] if len(rsi) > 0 else 50
+    rsi_score = (50 - abs(current_rsi - 50)) / 50  # Score higher when RSI is extreme
+    
+    # MACD for trend confirmation
+    macd_line, signal_line, macd_hist = calculate_macd(historical['Close'])
+    macd_momentum = 1 if macd_hist.iloc[-1] > 0 else 0
+    
+    # Volume confirmation (higher volume = stronger signal)
+    if 'Volume' in historical.columns:
+        vol_ma = historical['Volume'].tail(20).mean()
+        recent_vol_ratio = historical['Volume'].iloc[-1] / (vol_ma + 1e-10)
+        volume_score = min(recent_vol_ratio / 2, 1)  # Cap at 1
+    else:
+        volume_score = 0.5
+    
+    # Price relative to moving averages (mean reversion)
+    ma_20 = historical['Close'].tail(20).mean()
+    ma_50 = historical['Close'].tail(50).mean() if len(historical) >= 50 else ma_20
+    price_to_ma20 = historical['Close'].iloc[-1] / ma_20
+    price_to_ma50 = historical['Close'].iloc[-1] / ma_50
+    
+    # Mean reversion score (buy when below MA)
+    mr_score = 0
+    if price_to_ma20 < 0.98:  # Price below 20MA
+        mr_score += 0.3
+    if price_to_ma50 < 0.95:  # Price below 50MA
+        mr_score += 0.2
+    if current_rsi < 40:  # Oversold
+        mr_score += 0.3
+    if current_rsi < 30:  # Very oversold
+        mr_score += 0.2
+    
+    # Enhanced composite scoring with technical indicators
     composite_score = (
-        probability * 0.35 +
-        (sharpe if sharpe > 0 else 0) * 0.25 +
-        (1 - recent_vol) * 0.20 +
-        (momentum if momentum > 0 else 0) * 0.20
+        probability * 0.25 +
+        (sharpe if sharpe > 0 else 0) * 0.15 +
+        (1 - recent_vol * 10) * 0.10 +  # Lower vol preferred
+        (momentum if momentum > 0 else 0) * 10 * 0.10 +
+        rsi_score * 0.15 +
+        macd_momentum * 0.10 +
+        volume_score * 0.05 +
+        mr_score * 0.10
     )
     
     return {
@@ -171,7 +242,13 @@ def evaluate_stock(ticker, data, current_date):
         'Momentum': momentum,
         'Volatility': recent_vol,
         'Composite_Score': composite_score,
-        'Current_Price': historical['Close'].iloc[-1]
+        'Current_Price': historical['Close'].iloc[-1],
+        'ATR_Percent': atr_pct,
+        'RSI': current_rsi,
+        'MACD_Signal': macd_momentum,
+        'Volume_Score': volume_score,
+        'MR_Score': mr_score,
+        'Price_to_MA20': price_to_ma20
     }
 
 # portfolio mechanism
@@ -179,7 +256,7 @@ class DynamicPortfolioManager:
     def __init__(self, initial_capital, stocks_data, spy_data):
         self.initial_capital = initial_capital
         self.cash = initial_capital
-        self.positions = {}  # {ticker: {'shares': n, 'entry_price': p, 'entry_date': date}}
+        self.positions = {}  # {ticker: {'shares': n, 'entry_price': p, 'entry_date': date, 'atr_pct': atr, 'take_profit_pct': tp}}
         self.stocks_data = stocks_data
         self.spy_data = spy_data
         self.portfolio_history = []
@@ -199,7 +276,7 @@ class DynamicPortfolioManager:
         return total
     
     def check_stop_loss_take_profit(self, date):
-        """Check all positions for stop loss and take profit triggers"""
+        """Check all positions for stop loss and take profit triggers with dynamic TP"""
         to_sell = []
         
         for ticker, position in self.positions.items():
@@ -217,8 +294,11 @@ class DynamicPortfolioManager:
             return_pct = (current_price - entry_price) / entry_price
             days_held = (date - position['entry_date']).days
             
+            # Dynamic take profit based on ATR
+            dynamic_take_profit = position.get('take_profit_pct', 0.15)
+            
             # Check triggers
-            if return_pct >= TAKE_PROFIT_THRESHOLD and days_held >= MIN_HOLDING_DAYS:
+            if return_pct >= dynamic_take_profit and days_held >= MIN_HOLDING_DAYS:
                 to_sell.append((ticker, 'TAKE_PROFIT', return_pct))
             elif return_pct <= STOP_LOSS_THRESHOLD:
                 to_sell.append((ticker, 'STOP_LOSS', return_pct))
@@ -299,12 +379,18 @@ class DynamicPortfolioManager:
                     shares = int(target_per_stock / current_price)
                     cost = shares * current_price
                     
+                    # Calculate dynamic take profit based on ATR
+                    atr_pct = stock_eval.get('ATR_Percent', 0.05)
+                    dynamic_take_profit = max(atr_pct * ATR_MULTIPLIER, 0.12)  # minimum 12% TP
+                    
                     if shares > 0 and self.cash >= cost:
                         self.cash -= cost
                         self.positions[ticker] = {
                             'shares': shares,
                             'entry_price': current_price,
-                            'entry_date': date
+                            'entry_date': date,
+                            'atr_pct': atr_pct,
+                            'take_profit_pct': dynamic_take_profit
                         }
                         
                         self.trades_log.append({
