@@ -13,17 +13,48 @@ warnings.filterwarnings('ignore')
 np.random.seed(42)
 torch.manual_seed(42)
 
-# trading config
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Configuration
 START_DATE = '2025-01-01'
 END_DATE = '2025-12-24'
 INITIAL_CAPITAL = 100000
-REBALANCE_FREQUENCY = 'M'  # monthly rebalancing for investment strategy
+REBALANCE_FREQUENCY = 'M' 
 MIN_STOCKS = 2
 MAX_STOCKS = 7
-ATR_MULTIPLIER = 2.5  # dynamic take profit = ATR * multiplier
-STOP_LOSS_THRESHOLD = -0.10   # 10% stop loss (wider for investment strategy)
-MIN_PROBABILITY = 0.55         # minimum probability to enter position
-MIN_HOLDING_DAYS = 21           # minimum 21 days (~3 weeks) to hold before selling
+ATR_MULTIPLIER = 2.5
+STOP_LOSS_THRESHOLD = -0.10
+MIN_PROBABILITY = 0.55
+MIN_HOLDING_DAYS = 14
+MIN_HOLDING_DAYS_LOSERS = 5
+
+REGIME_LOOKBACK = 60
+BULL_THRESHOLD = 0.05
+BEAR_THRESHOLD = -0.05
+
+def detect_market_regime(spy_data, current_date):
+    historical = spy_data[spy_data.index <= current_date]
+    if len(historical) < REGIME_LOOKBACK:
+        return 'SIDEWAYS', 0
+    
+    recent = historical.tail(REGIME_LOOKBACK)
+    period_return = (recent['Close'].iloc[-1] / recent['Close'].iloc[0]) - 1
+    
+    # Calculate trend strength using linear regression
+    returns = recent['Close'].pct_change().dropna()
+    trend_strength = returns.mean() * 252 
+    
+    # Volatility regime
+    volatility = returns.std() * np.sqrt(252)
+    
+    if period_return > BULL_THRESHOLD and trend_strength > 0.10:
+        regime = 'BULL'
+    elif period_return < BEAR_THRESHOLD and trend_strength < -0.10:
+        regime = 'BEAR'
+    else:
+        regime = 'SIDEWAYS'
+    
+    return regime, trend_strength, volatility
 
 print("\n" + "="*80)
 print(" Portfolio Equity Simulation ")
@@ -109,7 +140,6 @@ def train_model(returns, lookback=20, epochs=30):
     return model
 
 def predict_with_model(model, recent_returns):
-    """make prediction based on test"""
     model.eval()
     with torch.no_grad():
         X = torch.FloatTensor(recent_returns[-20:].values).unsqueeze(0)
@@ -118,7 +148,6 @@ def predict_with_model(model, recent_returns):
 
 # Helper function for RSI calculation
 def calculate_rsi(prices, period=14):
-    """Calculate RSI indicator"""
     delta = prices.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -128,7 +157,6 @@ def calculate_rsi(prices, period=14):
 
 # Helper function for MACD
 def calculate_macd(prices, fast=12, slow=26, signal=9):
-    """Calculate MACD indicator"""
     ema_fast = prices.ewm(span=fast, adjust=False).mean()
     ema_slow = prices.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -137,8 +165,7 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     return macd_line, signal_line, histogram
 
 # eval performance
-def evaluate_stock(ticker, data, current_date):
-    """Evaluate a stock using transformer and t-student distt to pick for trade"""
+def evaluate_stock(ticker, data, current_date, market_regime='SIDEWAYS'):
     # get data up to current date
     historical = data[data.index <= current_date]
     if len(historical) < 40:
@@ -156,23 +183,18 @@ def evaluate_stock(ticker, data, current_date):
     # prediction
     mean_pred, std_pred = predict_with_model(model, returns)
     
-    # T-distribution statistics
     df_freedom = len(returns) - 1
     t_stat = mean_pred / (std_pred + 1e-8)
     p_value = 1 - stats.t.cdf(abs(t_stat), df_freedom)
     probability = 1 - 2 * p_value if t_stat > 0 else 2 * p_value
     
-    # Confidence interval
     t_critical = stats.t.ppf(0.975, df_freedom)
     ci_lower = mean_pred - t_critical * std_pred
     ci_upper = mean_pred + t_critical * std_pred
     
-    # Additional metrics
     recent_vol = returns.tail(20).std()
-    momentum = returns.tail(10).mean()
     sharpe = mean_pred / (std_pred + 1e-8) if std_pred > 0 else 0
     
-    # Calculate ATR (Average True Range) for dynamic take profit
     high = historical['High'].tail(20)
     low = historical['Low'].tail(20)
     close = historical['Close'].tail(20)
@@ -182,53 +204,83 @@ def evaluate_stock(ticker, data, current_date):
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.mean()
-    atr_pct = atr / close.iloc[-1]  # ATR as percentage of current price
+    atr_pct = atr / close.iloc[-1]
     
-    # RSI for mean reversion signal (oversold = buy opportunity)
     rsi = calculate_rsi(historical['Close'], period=14)
     current_rsi = rsi.iloc[-1] if len(rsi) > 0 else 50
-    rsi_score = (50 - abs(current_rsi - 50)) / 50  # Score higher when RSI is extreme
     
-    # MACD for trend confirmation
     macd_line, signal_line, macd_hist = calculate_macd(historical['Close'])
     macd_momentum = 1 if macd_hist.iloc[-1] > 0 else 0
+    macd_trend = 1 if macd_line.iloc[-1] > signal_line.iloc[-1] else 0
     
-    # Volume confirmation (higher volume = stronger signal)
     if 'Volume' in historical.columns:
         vol_ma = historical['Volume'].tail(20).mean()
         recent_vol_ratio = historical['Volume'].iloc[-1] / (vol_ma + 1e-10)
-        volume_score = min(recent_vol_ratio / 2, 1)  # Cap at 1
+        volume_score = min(recent_vol_ratio / 2, 1)
     else:
         volume_score = 0.5
     
-    # Price relative to moving averages (mean reversion)
     ma_20 = historical['Close'].tail(20).mean()
     ma_50 = historical['Close'].tail(50).mean() if len(historical) >= 50 else ma_20
     price_to_ma20 = historical['Close'].iloc[-1] / ma_20
     price_to_ma50 = historical['Close'].iloc[-1] / ma_50
     
-    # Mean reversion score (buy when below MA)
-    mr_score = 0
-    if price_to_ma20 < 0.98:  # Price below 20MA
-        mr_score += 0.3
-    if price_to_ma50 < 0.95:  # Price below 50MA
-        mr_score += 0.2
-    if current_rsi < 40:  # Oversold
-        mr_score += 0.3
-    if current_rsi < 30:  # Very oversold
-        mr_score += 0.2
+    # Momentum score
+    momentum_5d = returns.tail(5).sum()
+    momentum_10d = returns.tail(10).sum()
+    momentum_20d = returns.tail(20).sum()
     
-    # Enhanced composite scoring with technical indicators
-    composite_score = (
-        probability * 0.25 +
-        (sharpe if sharpe > 0 else 0) * 0.15 +
-        (1 - recent_vol * 10) * 0.10 +  # Lower vol preferred
-        (momentum if momentum > 0 else 0) * 10 * 0.10 +
-        rsi_score * 0.15 +
-        macd_momentum * 0.10 +
-        volume_score * 0.05 +
-        mr_score * 0.10
-    )
+    momentum_score = 0
+    if momentum_5d > 0.02:
+        momentum_score += 0.3
+    if momentum_10d > 0.03:
+        momentum_score += 0.3
+    if momentum_20d > 0.05:
+        momentum_score += 0.2
+    if price_to_ma20 > 1.02:
+        momentum_score += 0.2
+    
+    # Mean reversion score
+    mr_score = 0
+    if price_to_ma20 < 0.98:
+        mr_score += 0.25
+    if price_to_ma50 < 0.95:
+        mr_score += 0.25
+    if current_rsi < 40:
+        mr_score += 0.25
+    if current_rsi < 30:
+        mr_score += 0.25
+    
+    # Regime-adaptive composite scoring
+    if market_regime == 'BULL':
+        composite_score = (
+            probability * 0.15 +
+            (sharpe if sharpe > 0 else 0) * 0.10 +
+            momentum_score * 0.35 +
+            macd_trend * 0.15 +
+            volume_score * 0.10 +
+            (1 - recent_vol * 5) * 0.05 +
+            (0.1 if price_to_ma20 > 1.0 else 0) * 0.10
+        )
+    elif market_regime == 'BEAR':
+        composite_score = (
+            probability * 0.20 +
+            (sharpe if sharpe > 0 else 0) * 0.15 +
+            mr_score * 0.35 +
+            (1 - recent_vol * 5) * 0.10 +
+            volume_score * 0.10 +
+            (0.1 if current_rsi < 35 else 0) * 0.10
+        )
+    else:
+        composite_score = (
+            probability * 0.20 +
+            (sharpe if sharpe > 0 else 0) * 0.15 +
+            momentum_score * 0.20 +
+            mr_score * 0.15 +
+            macd_momentum * 0.10 +
+            volume_score * 0.10 +
+            (1 - recent_vol * 5) * 0.10
+        )
     
     return {
         'Ticker': ticker,
@@ -239,7 +291,8 @@ def evaluate_stock(ticker, data, current_date):
         'CI_Lower': ci_lower,
         'CI_Upper': ci_upper,
         'Sharpe': sharpe,
-        'Momentum': momentum,
+        'Momentum_Score': momentum_score,
+        'MR_Score': mr_score,
         'Volatility': recent_vol,
         'Composite_Score': composite_score,
         'Current_Price': historical['Close'].iloc[-1],
@@ -247,23 +300,20 @@ def evaluate_stock(ticker, data, current_date):
         'RSI': current_rsi,
         'MACD_Signal': macd_momentum,
         'Volume_Score': volume_score,
-        'MR_Score': mr_score,
         'Price_to_MA20': price_to_ma20
     }
 
-# portfolio mechanism
 class DynamicPortfolioManager:
     def __init__(self, initial_capital, stocks_data, spy_data):
         self.initial_capital = initial_capital
         self.cash = initial_capital
-        self.positions = {}  # {ticker: {'shares': n, 'entry_price': p, 'entry_date': date, 'atr_pct': atr, 'take_profit_pct': tp}}
+        self.positions = {}
         self.stocks_data = stocks_data
         self.spy_data = spy_data
         self.portfolio_history = []
         self.trades_log = []
         
     def get_portfolio_value(self, date):
-        """Calculate total portfolio value at given date"""
         total = self.cash
         for ticker, position in self.positions.items():
             if ticker in self.stocks_data:
@@ -276,7 +326,6 @@ class DynamicPortfolioManager:
         return total
     
     def check_stop_loss_take_profit(self, date):
-        """Check all positions for stop loss and take profit triggers with dynamic TP"""
         to_sell = []
         
         for ticker, position in self.positions.items():
@@ -308,7 +357,6 @@ class DynamicPortfolioManager:
             self.sell_position(ticker, date, reason, return_pct)
     
     def sell_position(self, ticker, date, reason, return_pct):
-        """Sell a position"""
         if ticker not in self.positions:
             return
             
@@ -332,13 +380,23 @@ class DynamicPortfolioManager:
         
         del self.positions[ticker]
     
-    def rebalance(self, date, candidate_evaluations):
-        """Rebalance portfolio based on new evaluations"""
-        # Filter candidates
-        valid_candidates = [
-            c for c in candidate_evaluations 
-            if c['Probability'] >= MIN_PROBABILITY and c['CI_Lower'] > 0
-        ]
+    def rebalance(self, date, candidate_evaluations, market_regime='SIDEWAYS'):
+        
+        if market_regime == 'BULL':
+            valid_candidates = [
+                c for c in candidate_evaluations 
+                if c['Probability'] >= 0.50 and c['Momentum_Score'] > 0.2
+            ]
+        elif market_regime == 'BEAR':
+            valid_candidates = [
+                c for c in candidate_evaluations 
+                if c['Probability'] >= MIN_PROBABILITY and c['CI_Lower'] > -0.01 and c['RSI'] < 50
+            ]
+        else:
+            valid_candidates = [
+                c for c in candidate_evaluations 
+                if c['Probability'] >= MIN_PROBABILITY and c['CI_Lower'] > 0
+            ]
         
         # Sort by composite score
         valid_candidates.sort(key=lambda x: x['Composite_Score'], reverse=True)
@@ -355,33 +413,35 @@ class DynamicPortfolioManager:
         
         selected_tickers = [s['Ticker'] for s in selected]
         
-        # Sell positions not in new selection (after minimum holding period)
+        # Sell positions not in new selection
+        # Use shorter holding for losers, longer for winners
         for ticker in list(self.positions.keys()):
             days_held = (date - self.positions[ticker]['entry_date']).days
-            if ticker not in selected_tickers and days_held >= MIN_HOLDING_DAYS:
-                price_data = self.stocks_data[ticker]
-                current_price = price_data[price_data.index <= date]['Close'].iloc[-1]
-                return_pct = (current_price - self.positions[ticker]['entry_price']) / self.positions[ticker]['entry_price']
+            price_data = self.stocks_data[ticker]
+            current_price = price_data[price_data.index <= date]['Close'].iloc[-1]
+            return_pct = (current_price - self.positions[ticker]['entry_price']) / self.positions[ticker]['entry_price']
+            
+            # hold tergantung atr dan t-student dari portAlloc
+            min_hold = MIN_HOLDING_DAYS_LOSERS if return_pct < 0 else MIN_HOLDING_DAYS
+            
+            if ticker not in selected_tickers and days_held >= min_hold:
                 self.sell_position(ticker, date, 'REBALANCE', return_pct)
         
-        # Calculate target allocation
         total_value = self.get_portfolio_value(date)
         target_per_stock = total_value / len(selected)
         
-        # Buy new positions or adjust existing
         for stock_eval in selected:
             ticker = stock_eval['Ticker']
             current_price = stock_eval['Current_Price']
             
             if ticker not in self.positions:
-                # New position
+                
                 if self.cash > target_per_stock:
                     shares = int(target_per_stock / current_price)
                     cost = shares * current_price
                     
-                    # Calculate dynamic take profit based on ATR
                     atr_pct = stock_eval.get('ATR_Percent', 0.05)
-                    dynamic_take_profit = max(atr_pct * ATR_MULTIPLIER, 0.12)  # minimum 12% TP
+                    dynamic_take_profit = max(atr_pct * ATR_MULTIPLIER, 0.12)
                     
                     if shares > 0 and self.cash >= cost:
                         self.cash -= cost
@@ -405,12 +465,10 @@ class DynamicPortfolioManager:
                         })
     
     def run_backtest(self, start_date, end_date):
-        """Run portfolio backtest"""
         print("\n" + "="*80)
         print("RUNNING BACKTEST")
         print("="*80)
         
-        # Convert string dates to datetime to prevent bug
         if isinstance(start_date, str):
             start_date = pd.to_datetime(start_date)
         if isinstance(end_date, str):
@@ -448,19 +506,20 @@ class DynamicPortfolioManager:
             
             # Rebalance on schedule
             if date in rebalance_dates:
-                print(f"\n[{date.strftime('%Y-%m-%d')}] Rebalancing")
+                # DETECT MARKET REGIME
+                regime, trend_strength, market_vol = detect_market_regime(self.spy_data, date)
+                print(f"\n[{date.strftime('%Y-%m-%d')}] Rebalancing - Regime: {regime} (trend: {trend_strength:.2%})")
                 
-                # Evaluate all stocks
+                # Evaluate all stocks with regime context
                 evaluations = []
                 for ticker in available_tickers:
-                    eval_result = evaluate_stock(ticker, self.stocks_data[ticker], date)
+                    eval_result = evaluate_stock(ticker, self.stocks_data[ticker], date, regime)
                     if eval_result:
                         evaluations.append(eval_result)
                 
-                print(f"Evaluated {len(evaluations)} stocks")
+                print(f"  Evaluated {len(evaluations)} stocks")
                 
-                # Rebalancing update
-                self.rebalance(date, evaluations)
+                self.rebalance(date, evaluations, regime)
                 
                 print(f"  Positions: {len(self.positions)}")
                 print(f"  Cash: ${self.cash:,.0f}")
@@ -482,11 +541,6 @@ class DynamicPortfolioManager:
 manager = DynamicPortfolioManager(INITIAL_CAPITAL, stocks_data, spy_data)
 manager.run_backtest(START_DATE, END_DATE)
 
-# acalculate performance metrics
-print("\n" + "="*80)
-print("CALCULATING PERFORMANCE METRICS")
-print("="*80)
-
 portfolio_df = pd.DataFrame(manager.portfolio_history)
 
 if len(portfolio_df) == 0:
@@ -498,14 +552,11 @@ if len(portfolio_df) == 0:
 
 portfolio_df.set_index('Date', inplace=True)
 
-# Portfolio returns
 portfolio_df['Portfolio_Return'] = portfolio_df['Portfolio_Value'].pct_change()
 
-# Benchmark returns
 spy_start = spy_data[spy_data.index >= START_DATE]
 spy_returns = spy_start['Close'].pct_change().dropna()
 
-# Align data
 common_idx = portfolio_df.index.intersection(spy_returns.index)
 portfolio_returns = portfolio_df.loc[common_idx, 'Portfolio_Return'].dropna()
 spy_returns_aligned = spy_returns.loc[common_idx]
@@ -626,22 +677,19 @@ if len(manager.positions) > 0:
 else:
     portfolio_comp = pd.DataFrame({'Ticker': ['CASH'], 'Weight': [1.0]})
 
-portfolio_comp.to_csv('c:\\Users\\seva\\transformer-mr-model\\portfolio_composition.csv', index=False)
+portfolio_comp.to_csv(os.path.join(BASE_DIR, 'portfolio_composition.csv'), index=False)
 
-# Performance metrics
 metrics_df = pd.DataFrame({
     'Metric': list(port_metrics.keys()),
     'Portfolio': list(port_metrics.values()),
     'Benchmark': list(bench_metrics.values())
 })
-metrics_df.to_csv('c:\\Users\\seva\\transformer-mr-model\\performance_metrics.csv', index=False)
+metrics_df.to_csv(os.path.join(BASE_DIR, 'performance_metrics.csv'), index=False)
 
-# Trades log
 if len(trades_df) > 0:
-    trades_df.to_csv('c:\\Users\\seva\\transformer-mr-model\\trades_log.csv', index=False)
+    trades_df.to_csv(os.path.join(BASE_DIR, 'trades_log.csv'), index=False)
 
-# Portfolio history
-portfolio_df.to_csv('c:\\Users\\seva\\transformer-mr-model\\portfolio_history.csv')
+portfolio_df.to_csv(os.path.join(BASE_DIR, 'portfolio_history.csv'))
 
 print("\nSaved: portfolio_composition.csv")
 print("Saved: performance_metrics.csv")
@@ -649,6 +697,6 @@ print("Saved: trades_log.csv")
 print("Saved: portfolio_history.csv")
 
 print("\n" + "="*80)
-print("ANALYSIS COMPLETE!")
+print("COMPLETE")
 print("="*80)
 print()

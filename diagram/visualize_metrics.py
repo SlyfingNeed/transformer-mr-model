@@ -4,13 +4,15 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
-# Load all data
-performance = pd.read_csv('performance_metrics.csv')
-portfolio_history = pd.read_csv('portfolio_history.csv', parse_dates=['Date'], index_col='Date')
-trades_log = pd.read_csv('trades_log.csv', parse_dates=['Date'])
-portfolio_comp = pd.read_csv('portfolio_composition.csv')
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+performance = pd.read_csv(os.path.join(BASE_DIR, 'performance_metrics.csv'))
+portfolio_history = pd.read_csv(os.path.join(BASE_DIR, 'portfolio_history.csv'), parse_dates=['Date'], index_col='Date')
+trades_log = pd.read_csv(os.path.join(BASE_DIR, 'trades_log.csv'), parse_dates=['Date'])
+portfolio_comp = pd.read_csv(os.path.join(BASE_DIR, 'portfolio_composition.csv'))
 
 print(f"Portfolio history: {len(portfolio_history)} days")
 print(f"Trades executed: {len(trades_log)}")
@@ -283,5 +285,5 @@ plt.tight_layout()
 plt.savefig('trade_analysis.png', dpi=300, bbox_inches='tight', facecolor='white')
 print("Saved: trade_analysis.png")
 
-print("VISUALIZATION COMPLETE")
+print("Done")
 plt.show()
